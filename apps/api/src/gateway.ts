@@ -1947,5 +1947,11 @@ app.post("/v1/chat/completions", async (req, reply) => {
     });
 });
 
-const port = Number(process.env.PORT ?? 3000);
-await app.listen({ port, host: "0.0.0.0" });
+export { app };
+
+// The Vercel function adapter forwards requests to Fastify. Run a listener
+// only for local development and standalone deployments.
+if (process.env.VERCEL !== "1") {
+  const port = Number(process.env.PORT ?? 3000);
+  await app.listen({ port, host: "0.0.0.0" });
+}

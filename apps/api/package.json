@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx watch src/gateway.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit false --outDir dist",
-    "start": "node dist/server.js",
+    "start": "node dist/gateway.js",
     "migrate:local": "tsx src/migrate-local.ts"
   },
   "dependencies": {
