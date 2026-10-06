@@ -1941,5 +1941,11 @@ app.post("/v1/chat/completions", async (req, reply) => {
     });
 });
 
-const port = Number(process.env.PORT ?? 3000);
-await app.listen({ port, host: "0.0.0.0" });
+export { app };
+
+// Vercel invokes the app through api/index.ts. Keep the standalone listener for
+// local development and non-serverless deployments.
+if (process.env.VERCEL !== "1") {
+  const port = Number(process.env.PORT ?? 3000);
+  await app.listen({ port, host: "0.0.0.0" });
+}
