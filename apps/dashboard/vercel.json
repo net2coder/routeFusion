@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/", "destination": "/index.html" },
+    { "source": "/overview", "destination": "/index.html" },
+    { "source": "/providers", "destination": "/index.html" },
+    { "source": "/models", "destination": "/index.html" },
+    { "source": "/routing", "destination": "/index.html" },
+    { "source": "/requests", "destination": "/index.html" },
+    { "source": "/usage", "destination": "/index.html" },
+    { "source": "/health", "destination": "/index.html" },
+    { "source": "/api-keys", "destination": "/index.html" },
+    { "source": "/settings", "destination": "/index.html" },
+    { "source": "/about", "destination": "/index.html" }
+  ]
+}

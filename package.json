@@ -1,0 +1,19 @@
+{
+  "name": "routefusion",
+  "private": true,
+  "workspaces": [
+    "apps/api",
+    "apps/dashboard"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c green,cyan \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "npm --workspace apps/api run dev",
+    "dev:web": "npm --workspace apps/dashboard run dev",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build": "npm run build --workspace @routefusion/api && npm run build --workspace @routefusion/dashboard"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}
