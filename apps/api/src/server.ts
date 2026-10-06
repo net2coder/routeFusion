@@ -1025,6 +1025,12 @@ async function persistProviderHealthSafely(p: Provider) {
   }
 }
 
+app.get("/", async () => ({
+  service: "routefusion-api",
+  status: "ok",
+  health: "/health",
+  ready: "/health/ready",
+}));
 app.get("/health", async () => ({ status: "ok", service: "routefusion-api" }));
 app.get("/health/ready", async (_req, reply) => {
   if (!supabase) return { status: "ready", storage: "local" };
