@@ -66,10 +66,17 @@ const supabase: SupabaseClient | null = databaseEnabled
 const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL ?? "info",
-    redact: ["req.headers.authorization", "req.body.apiKey"],
+    redact: [
+      "req.headers.authorization",
+      "req.headers.x-api-key",
+      "req.body.apiKey",
+    ],
   },
   bodyLimit: 1_048_576,
 });
+function headerValue(value: string | string[] | undefined) {
+  return Array.isArray(value) ? value[0] : value;
+}
 const allowedOrigins = process.env.CORS_ORIGIN?.split(",")
   .map((origin) => origin.trim())
   .filter(Boolean) ?? ["http://localhost:5173"];
@@ -91,7 +98,16 @@ if (
   throw new Error(
     "Production CORS_ORIGIN entries must be exact HTTPS origins without paths.",
   );
-await app.register(cors, { origin: allowedOrigins });
+await app.register(cors, {
+  origin: allowedOrigins,
+  allowedHeaders: [
+    "authorization",
+    "content-type",
+    "x-api-key",
+    "anthropic-version",
+    "anthropic-beta",
+  ],
+});
 const requestsPerMinute = Math.max(
   1,
   Math.min(
@@ -103,7 +119,9 @@ await app.register(rateLimit, {
   max: supabase ? 300 : requestsPerMinute,
   timeWindow: "1 minute",
   keyGenerator: (req) => {
-    const token = req.headers.authorization?.replace(/^Bearer\s+/, "");
+    const token =
+      req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+      headerValue(req.headers["x-api-key"]);
     return token ? createHash("sha256").update(token).digest("hex") : req.ip;
   },
 });
@@ -115,23 +133,32 @@ app.setErrorHandler((error, req, reply) => {
       : undefined;
   const status =
     typeof candidate === "number" && candidate >= 400 ? candidate : 500;
-  return reply
-    .code(status)
-    .send({
+  const message = status >= 500
+    ? "The gateway could not complete the request."
+    : "The request could not be processed.";
+  if (req.url.startsWith("/v1/messages"))
+    return reply.code(status).send({
+      type: "error",
       error: {
-        message:
-          status >= 500
-            ? "The gateway could not complete the request."
-            : "The request could not be processed.",
+        message,
+        type: status >= 500 ? "api_error" : "invalid_request_error",
+      },
+    });
+  return reply.code(status).send({
+      error: {
+        message,
         type: status >= 500 ? "server_error" : "request_error",
         request_id: req.id,
       },
     });
 });
 app.setNotFoundHandler((req, reply) =>
-  reply
-    .code(404)
-    .send({
+  req.url.startsWith("/v1/messages")
+    ? reply.code(404).send({
+        type: "error",
+        error: { message: "Route not found", type: "not_found_error" },
+      })
+    : reply.code(404).send({
       error: {
         message: "Route not found",
         type: "not_found",
@@ -717,6 +744,393 @@ const chatSchema = z
     temperature: z.number().optional(),
   })
   .passthrough();
+const anthropicMessageSchema = z
+  .object({
+    model: z.string().trim().min(1),
+    messages: z
+      .array(
+        z
+          .object({
+            role: z.enum(["user", "assistant"]),
+            content: z.union([z.string(), z.array(z.any())]),
+          })
+          .passthrough(),
+      )
+      .min(1),
+    max_tokens: z.number().int().positive(),
+    stream: z.boolean().optional().default(false),
+    system: z.any().optional(),
+    temperature: z.number().optional(),
+    top_p: z.number().optional(),
+    stop_sequences: z.array(z.string()).optional(),
+    tools: z.array(z.any()).optional(),
+    tool_choice: z.any().optional(),
+  })
+  .passthrough();
+
+type AnthropicRequest = z.infer<typeof anthropicMessageSchema>;
+type OpenAICompletion = {
+  id?: string;
+  model?: string;
+  choices?: Array<{
+    finish_reason?: string | null;
+    message?: {
+      content?: string | null;
+      tool_calls?: Array<{
+        id?: string;
+        function?: { name?: string; arguments?: string };
+      }>;
+    };
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+};
+
+function anthropicContentToOpenAI(content: unknown): unknown {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content ?? "";
+  return content.flatMap<unknown>((block) => {
+    if (!block || typeof block !== "object") return [];
+    const item = block as Record<string, any>;
+    if (item.type === "text") return [{ type: "text", text: item.text ?? "" }];
+    if (item.type === "image") {
+      const source = item.source;
+      if (source?.type === "url")
+        return [{ type: "image_url", image_url: { url: source.url } }];
+      if (source?.type === "base64" && source.data && source.media_type)
+        return [
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:${source.media_type};base64,${source.data}`,
+            },
+          },
+        ];
+      return [];
+    }
+    return [];
+  });
+}
+
+function anthropicToOpenAI(body: AnthropicRequest) {
+  const messages: Array<Record<string, unknown>> = [];
+  const system = anthropicContentToOpenAI(body.system);
+  if (typeof system === "string" && system)
+    messages.push({ role: "system", content: system });
+  else if (Array.isArray(system) && system.length)
+    messages.push({ role: "system", content: system });
+
+  for (const message of body.messages) {
+    if (typeof message.content === "string") {
+      messages.push({ role: message.role, content: message.content });
+      continue;
+    }
+    const blocks = message.content as Array<Record<string, any>>;
+    const normalBlocks = blocks.filter(
+      (block) => block?.type !== "tool_result" && block?.type !== "thinking",
+    );
+    const content = anthropicContentToOpenAI(normalBlocks);
+    const toolCalls =
+      message.role === "assistant"
+        ? blocks
+            .filter((block) => block?.type === "tool_use")
+            .map((block) => ({
+              id: block.id,
+              type: "function",
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input ?? {}),
+              },
+            }))
+        : [];
+    if (
+      (typeof content === "string" && content) ||
+      (Array.isArray(content) && content.length) ||
+      toolCalls.length
+    ) {
+      messages.push({
+        role: message.role,
+        content: Array.isArray(content) ? content : content || null,
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      });
+    }
+    if (message.role === "user") {
+      for (const result of blocks.filter((block) => block?.type === "tool_result")) {
+        const resultContent = anthropicContentToOpenAI(result.content);
+        messages.push({
+          role: "tool",
+          tool_call_id: result.tool_use_id,
+          content:
+            typeof resultContent === "string"
+              ? resultContent
+              : JSON.stringify(resultContent),
+        });
+      }
+    }
+  }
+
+  const tools = body.tools?.map((tool: any) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.input_schema ?? { type: "object", properties: {} },
+    },
+  }));
+  let toolChoice: unknown;
+  if (body.tool_choice?.type === "auto") toolChoice = "auto";
+  else if (body.tool_choice?.type === "none") toolChoice = "none";
+  else if (body.tool_choice?.type === "any") toolChoice = "required";
+  else if (body.tool_choice?.type === "tool")
+    toolChoice = {
+      type: "function",
+      function: { name: body.tool_choice.name },
+    };
+
+  return {
+    model: body.model,
+    messages,
+    stream: body.stream,
+    max_tokens: body.max_tokens,
+    temperature: body.temperature,
+    top_p: body.top_p,
+    stop: body.stop_sequences,
+    ...(tools?.length ? { tools } : {}),
+    ...(toolChoice ? { tool_choice: toolChoice } : {}),
+  };
+}
+
+function toAnthropicMessage(response: OpenAICompletion, requestedModel: string) {
+  const choice = response.choices?.[0];
+  const content: Array<Record<string, unknown>> = [];
+  if (choice?.message?.content)
+    content.push({ type: "text", text: choice.message.content });
+  for (const call of choice?.message?.tool_calls ?? []) {
+    let input: unknown = {};
+    try {
+      input = JSON.parse(call.function?.arguments ?? "{}");
+    } catch {
+      input = {};
+    }
+    content.push({
+      type: "tool_use",
+      id: call.id ?? `toolu_${randomUUID().replaceAll("-", "")}`,
+      name: call.function?.name ?? "tool",
+      input,
+    });
+  }
+  const finish = choice?.finish_reason;
+  const stopReason =
+    finish === "length"
+      ? "max_tokens"
+      : finish === "tool_calls" || finish === "function_call"
+        ? "tool_use"
+        : "end_turn";
+  return {
+    id: response.id?.startsWith("msg_")
+      ? response.id
+      : `msg_${randomUUID().replaceAll("-", "")}`,
+    type: "message",
+    role: "assistant",
+    content,
+    model: requestedModel,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: response.usage?.prompt_tokens ?? 0,
+      output_tokens: response.usage?.completion_tokens ?? 0,
+    },
+  };
+}
+
+function anthropicSse(event: string, data: unknown) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function toAnthropicStream(source: Readable, requestedModel: string) {
+  const generate = async function* () {
+    const messageId = `msg_${randomUUID().replaceAll("-", "")}`;
+    let started = false;
+    let nextBlockIndex = 0;
+    let textBlockIndex: number | null = null;
+    let stopReason = "end_turn";
+    let outputTokens = 0;
+    const toolBlocks = new Map<
+      number,
+      { blockIndex: number; id: string; name: string }
+    >();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    const startMessage = () => {
+      if (started) return "";
+      started = true;
+      return anthropicSse("message_start", {
+        type: "message_start",
+        message: {
+          id: messageId,
+          type: "message",
+          role: "assistant",
+          content: [],
+          model: requestedModel,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      });
+    };
+
+    const processData = (data: string) => {
+      if (data === "[DONE]") return "";
+      let chunk: any;
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        return "";
+      }
+      let output = startMessage();
+      outputTokens = chunk.usage?.completion_tokens ?? outputTokens;
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta;
+      if (typeof delta?.content === "string" && delta.content) {
+        if (textBlockIndex === null) {
+          textBlockIndex = nextBlockIndex++;
+          output += anthropicSse("content_block_start", {
+            type: "content_block_start",
+            index: textBlockIndex,
+            content_block: { type: "text", text: "" },
+          });
+        }
+        output += anthropicSse("content_block_delta", {
+          type: "content_block_delta",
+          index: textBlockIndex,
+          delta: { type: "text_delta", text: delta.content },
+        });
+      }
+      for (const call of delta?.tool_calls ?? []) {
+        const toolIndex = call.index ?? 0;
+        let block = toolBlocks.get(toolIndex);
+        if (!block) {
+          if (textBlockIndex !== null) {
+            output += anthropicSse("content_block_stop", {
+              type: "content_block_stop",
+              index: textBlockIndex,
+            });
+            textBlockIndex = null;
+          }
+          block = {
+            blockIndex: nextBlockIndex++,
+            id: call.id ?? `toolu_${randomUUID().replaceAll("-", "")}`,
+            name: call.function?.name ?? "tool",
+          };
+          toolBlocks.set(toolIndex, block);
+          output += anthropicSse("content_block_start", {
+            type: "content_block_start",
+            index: block.blockIndex,
+            content_block: {
+              type: "tool_use",
+              id: block.id,
+              name: block.name,
+              input: {},
+            },
+          });
+        } else {
+          if (call.id) block.id = call.id;
+          if (call.function?.name) block.name = call.function.name;
+        }
+        const partial = call.function?.arguments;
+        if (typeof partial === "string" && partial)
+          output += anthropicSse("content_block_delta", {
+            type: "content_block_delta",
+            index: block.blockIndex,
+            delta: { type: "input_json_delta", partial_json: partial },
+          });
+      }
+      if (choice?.finish_reason) {
+        stopReason =
+          choice.finish_reason === "length"
+            ? "max_tokens"
+            : choice.finish_reason === "tool_calls" ||
+                choice.finish_reason === "function_call"
+              ? "tool_use"
+              : "end_turn";
+      }
+      return output;
+    };
+
+    yield anthropicSse("message_start", {
+      type: "message_start",
+      message: {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: requestedModel,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+    started = true;
+
+    for await (const chunk of source) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline).replace(/\r$/, "");
+        buffer = buffer.slice(newline + 1);
+        if (line.startsWith("data:")) {
+          const output = processData(line.slice(5).trimStart());
+          if (output) yield output;
+        }
+        newline = buffer.indexOf("\n");
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.startsWith("data:")) {
+      const output = processData(buffer.slice(5).trim());
+      if (output) yield output;
+    }
+    if (textBlockIndex !== null)
+      yield anthropicSse("content_block_stop", {
+        type: "content_block_stop",
+        index: textBlockIndex,
+      });
+    for (const block of toolBlocks.values())
+      yield anthropicSse("content_block_stop", {
+        type: "content_block_stop",
+        index: block.blockIndex,
+      });
+    yield anthropicSse("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: outputTokens },
+    });
+    yield anthropicSse("message_stop", { type: "message_stop" });
+  };
+  return Readable.from(generate());
+}
+
+function sendChatError(
+  reply: import("fastify").FastifyReply,
+  format: "openai" | "anthropic",
+  status: number,
+  type: string,
+  message: string,
+  requestId?: string,
+) {
+  if (format === "anthropic")
+    return reply.code(status).send({
+      type: "error",
+      error: { type, message },
+    });
+  return reply.code(status).send({
+    error: { message, type, ...(requestId ? { request_id: requestId } : {}) },
+  });
+}
 async function admin(auth?: string) {
   const token = auth?.replace(/^Bearer\s+/, "");
   if (supabase) {
@@ -733,8 +1147,8 @@ async function admin(auth?: string) {
 function hashClientKey(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
-async function clientAuth(auth?: string) {
-  const token = auth?.replace(/^Bearer\s+/, "");
+async function clientAuth(auth?: string, apiKey?: string) {
+  const token = auth?.replace(/^Bearer\s+/i, "") || apiKey?.trim();
   if (!token) return null;
   if (supabase) {
     const { data, error } = await supabase
@@ -1051,14 +1465,20 @@ app.get("/health/providers", async () =>
   })),
 );
 app.get("/v1/models", async (req, reply) => {
-  const authenticated = await clientAuth(req.headers.authorization);
+  const authenticated = await clientAuth(
+    req.headers.authorization,
+    headerValue(req.headers["x-api-key"]),
+  );
   if (!authenticated)
     return reply
       .code(401)
       .send({
         error: { message: "Invalid API key", type: "authentication_error" },
       });
-  const bearer = req.headers.authorization?.replace(/^Bearer\s+/, "") ?? "";
+  const bearer =
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+    headerValue(req.headers["x-api-key"]) ||
+    "";
   if (!(await consumeSharedRateLimit(bearer)))
     return reply
       .code(429)
@@ -1656,35 +2076,54 @@ app.delete("/admin/models/:id", async (req, reply) => {
   }
 });
 
-app.post("/v1/chat/completions", async (req, reply) => {
-  const authenticated = await clientAuth(req.headers.authorization);
+async function handleChatRequest(
+  req: import("fastify").FastifyRequest,
+  reply: import("fastify").FastifyReply,
+  body: z.infer<typeof chatSchema>,
+  format: "openai" | "anthropic",
+) {
+  const authenticated = await clientAuth(
+    req.headers.authorization,
+    headerValue(req.headers["x-api-key"]),
+  );
   if (!authenticated)
     return reply
       .code(401)
-      .send({
-        error: { message: "Invalid API key", type: "authentication_error" },
-      });
-  const bearer = req.headers.authorization?.replace(/^Bearer\s+/, "") ?? "";
+      .send(
+        format === "anthropic"
+          ? {
+              type: "error",
+              error: { type: "authentication_error", message: "Invalid API key" },
+            }
+          : {
+              error: {
+                message: "Invalid API key",
+                type: "authentication_error",
+              },
+            },
+      );
+  const bearer =
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+    headerValue(req.headers["x-api-key"]) ||
+    "";
   if (!(await consumeSharedRateLimit(bearer)))
     return reply
       .code(429)
-      .send({
-        error: { message: "Rate limit exceeded", type: "rate_limit_error" },
-      });
+      .send(
+        format === "anthropic"
+          ? {
+              type: "error",
+              error: { type: "rate_limit_error", message: "Rate limit exceeded" },
+            }
+          : {
+              error: {
+                message: "Rate limit exceeded",
+                type: "rate_limit_error",
+              },
+            },
+      );
   if (authenticated.id !== "environment")
     await touchClientKey(authenticated.id);
-  const parsed = chatSchema.safeParse(req.body);
-  if (!parsed.success)
-    return reply
-      .code(400)
-      .send({
-        error: {
-          message: "Invalid request",
-          type: "invalid_request_error",
-          details: parsed.error.flatten(),
-        },
-      });
-  const body = parsed.data;
   const id = `req_${randomUUID().slice(0, 8)}`;
   const started = Date.now();
   const attempts: string[] = [];
@@ -1706,15 +2145,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
       status: 503,
       attempts,
     });
-    return reply
-      .code(503)
-      .send({
-        error: {
-          message: "No enabled healthy compatible model backend is available",
-          type: "service_unavailable",
-          request_id: id,
-        },
-      });
+    return sendChatError(
+      reply,
+      format,
+      503,
+      format === "anthropic" ? "overloaded_error" : "service_unavailable",
+      "No enabled healthy compatible model backend is available",
+      id,
+    );
   }
   for (const { provider, model } of pool.slice(0, 3)) {
     if (Date.now() - started >= 240000) break;
@@ -1788,15 +2226,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
           status: upstream.status,
           attempts: [...attempts],
         });
-        return reply
-          .code(upstream.status)
-          .send({
-            error: {
-              message: "Provider rejected the request",
-              type: "provider_error",
-              request_id: id,
-            },
-          });
+        return sendChatError(
+          reply,
+          format,
+          upstream.status,
+          format === "anthropic" ? "api_error" : "provider_error",
+          "Provider rejected the request",
+          id,
+        );
       }
       await upstream.body?.cancel();
       continue;
@@ -1809,19 +2246,22 @@ app.post("/v1/chat/completions", async (req, reply) => {
     if (body.stream) {
       if (!upstream.body) {
         clearTimeout(timer);
-        return reply
-          .code(502)
-          .send({
-            error: {
-              message: "Provider returned an empty stream",
-              type: "provider_error",
-              request_id: id,
-            },
-          });
+        return sendChatError(
+          reply,
+          format,
+          502,
+          format === "anthropic" ? "api_error" : "provider_error",
+          "Provider returned an empty stream",
+          id,
+        );
       }
-      const stream = Readable.fromWeb(
+      const upstreamStream = Readable.fromWeb(
         upstream.body as import("node:stream/web").ReadableStream<Uint8Array>,
       );
+      const stream =
+        format === "anthropic"
+          ? toAnthropicStream(upstreamStream, body.model)
+          : upstreamStream;
       let completed = false;
       const settle = (status: number) => {
         if (completed) return;
@@ -1862,9 +2302,9 @@ app.post("/v1/chat/completions", async (req, reply) => {
     try {
       const text = await readLimitedText(upstream, 20 * 1024 * 1024);
       clearTimeout(timer);
-      let response: { usage?: { total_tokens?: number }; model?: string };
+      let response: OpenAICompletion;
       try {
-        response = JSON.parse(text) as typeof response;
+        response = JSON.parse(text) as OpenAICompletion;
       } catch {
         throw new Error("Provider returned an invalid JSON response");
       }
@@ -1877,10 +2317,16 @@ app.post("/v1/chat/completions", async (req, reply) => {
         provider: provider.name,
         actualModel: model.providerModelId,
         latency,
-        tokens: response.usage?.total_tokens ?? null,
+        tokens:
+          (response.usage?.total_tokens ??
+            (response.usage?.prompt_tokens ?? 0) +
+              (response.usage?.completion_tokens ?? 0)) ||
+          null,
         status: 200,
         attempts: [...attempts],
       });
+      if (format === "anthropic")
+        return toAnthropicMessage(response, body.model);
       response.model = body.model;
       return response;
     } catch (error) {
@@ -1909,18 +2355,16 @@ app.post("/v1/chat/completions", async (req, reply) => {
         status: 502,
         attempts: [...attempts],
       });
-      return reply
-        .code(502)
-        .send({
-          error: {
-            message:
-              error instanceof Error
-                ? error.message
-                : "Provider returned an invalid response",
-            type: "provider_error",
-            request_id: id,
-          },
-        });
+      return sendChatError(
+        reply,
+        format,
+        502,
+        format === "anthropic" ? "api_error" : "provider_error",
+        error instanceof Error
+          ? error.message
+          : "Provider returned an invalid response",
+        id,
+      );
     }
   }
   const status = attempts.at(-1)?.includes("429") ? 429 : 503;
@@ -1936,15 +2380,55 @@ app.post("/v1/chat/completions", async (req, reply) => {
     status,
     attempts,
   });
-  return reply
-    .code(status)
-    .send({
-      error: {
-        message: "All compatible backends failed",
-        type: "service_unavailable",
-        request_id: id,
-      },
-    });
+  return sendChatError(
+    reply,
+    format,
+    status,
+    format === "anthropic" ? "overloaded_error" : "service_unavailable",
+    "All compatible backends failed",
+    id,
+  );
+}
+
+app.post("/v1/chat/completions", async (req, reply) => {
+  const parsed = chatSchema.safeParse(req.body);
+  if (!parsed.success)
+    return sendChatError(
+      reply,
+      "openai",
+      400,
+      "invalid_request_error",
+      "Invalid request",
+    );
+  return handleChatRequest(req, reply, parsed.data, "openai");
+});
+
+app.post("/v1/messages", async (req, reply) => {
+  const parsed = anthropicMessageSchema.safeParse(req.body);
+  if (!parsed.success)
+    return sendChatError(
+      reply,
+      "anthropic",
+      400,
+      "invalid_request_error",
+      "Invalid Anthropic Messages request",
+    );
+  const converted = chatSchema.safeParse(anthropicToOpenAI(parsed.data));
+  if (!converted.success)
+    return sendChatError(
+      reply,
+      "anthropic",
+      400,
+      "invalid_request_error",
+      "Anthropic request could not be translated to the provider format",
+    );
+  return handleChatRequest(req, reply, converted.data, "anthropic");
+});
+
+app.route({
+  method: ["HEAD", "GET"],
+  url: "/api/hello",
+  handler: async () => ({ status: "ok" }),
 });
 
 export { app };

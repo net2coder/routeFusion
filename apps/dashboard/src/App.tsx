@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   Blocks,
   Command,
+  Code2,
   Copy,
   Download,
   Gauge,
@@ -140,7 +141,7 @@ const groups = [
       ["Health", ShieldCheck],
     ],
   },
-  { title: "Access", items: [["API Keys", KeyRound]] },
+  { title: "Access", items: [["API Keys", KeyRound], ["Connect", Code2]] },
   {
     title: "System",
     items: [
@@ -159,6 +160,7 @@ const routes: Record<string, string> = {
   "/usage": "Usage",
   "/health": "Health",
   "/api-keys": "API Keys",
+  "/connect": "Connect",
   "/settings": "Settings",
   "/about": "About",
 };
@@ -552,6 +554,9 @@ export default function App() {
           {page === "Health" && <HealthPage providers={providers} />}
           {page === "API Keys" && (
             <APIKeysPage keys={keys} onChanged={refresh} />
+          )}
+          {page === "Connect" && (
+            <ConnectPage apiUrl={API} keys={keys} models={models} />
           )}
           {page === "Settings" && (
             <SettingsPage
@@ -2106,6 +2111,84 @@ function UsagePage() {
     </>
   );
 }
+function ConnectPage({
+  apiUrl,
+  keys,
+  models,
+}: {
+  apiUrl: string;
+  keys: ClientKey[];
+  models: Model[];
+}) {
+  const [client, setClient] = useState<"anthropic" | "openai">("anthropic");
+  const [model, setModel] = useState(
+    models.find((item) => item.enabled)?.logicalModelId ?? "rf-auto",
+  );
+  const [keyId, setKeyId] = useState(keys.find((item) => !item.revokedAt)?.id ?? "");
+  const [key, setKey] = useState("");
+  const [copied, setCopied] = useState(false);
+  const base = (apiUrl || window.location.origin).replace(/\/$/, "");
+  const enabledModels = [...new Set(models.filter((item) => item.enabled).map((item) => item.logicalModelId))];
+  const chosenModel = enabledModels.includes(model) ? model : enabledModels[0] ?? "rf-auto";
+  const credential = key || "rf_live_paste-your-key-here";
+  const snippet = client === "anthropic"
+    ? `# Claude Code\n$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_AUTH_TOKEN="${credential}"\n$env:ANTHROPIC_MODEL="${chosenModel}"\nclaude`
+    : `# OpenAI-compatible clients\nfrom openai import OpenAI\n\nclient = OpenAI(\n    base_url="${base}/v1",\n    api_key="${credential}",\n)\n\nresponse = client.chat.completions.create(\n    model="${chosenModel}",\n    messages=[{"role": "user", "content": "Hello"}],\n)\nprint(response.choices[0].message.content)`;
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(snippet);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <>
+      <Heading title="Connect a client" sub="One gateway, two API adaptors. Choose a ready model and copy the matching client setup." />
+      <div className="connect-grid">
+        <section className="card connect-setup">
+          <div className="connect-kicker"><Code2 size={15} /> Client setup</div>
+          <Field label="Client protocol">
+            <select value={client} onChange={(e) => setClient(e.target.value as "anthropic" | "openai")}>
+              <option value="anthropic">Anthropic Messages · Claude Code</option>
+              <option value="openai">OpenAI Chat Completions</option>
+            </select>
+          </Field>
+          <Field label="Model">
+            <select value={chosenModel} onChange={(e) => setModel(e.target.value)}>
+              {enabledModels.length ? enabledModels.map((id) => <option key={id} value={id}>{id}</option>) : <option value="rf-auto">rf-auto · automatic routing</option>}
+            </select>
+          </Field>
+          <Field label="Client API key">
+            <select value={keyId} onChange={(e) => setKeyId(e.target.value)}>
+              <option value="">Paste key below</option>
+              {keys.filter((item) => !item.revokedAt).map((item) => <option key={item.id} value={item.id}>{item.name} · {item.prefix}…</option>)}
+            </select>
+          </Field>
+          <Field label="Paste key for this snippet (optional)">
+            <input type="password" autoComplete="off" placeholder="rf_live_…" value={key} onChange={(e) => setKey(e.target.value)} />
+          </Field>
+          <p className="connect-note">Keys are never saved here. Select a key as a reminder, then paste its full value below. RouteFusion only shows the secret when it is created or rotated.</p>
+        </section>
+        <section className="card connect-output">
+          <div className="connect-output-head">
+            <div><div className="connect-kicker">{client === "anthropic" ? "Anthropic Messages" : "OpenAI-compatible"}</div><span className="mono">{client === "anthropic" ? `${base}/v1/messages` : `${base}/v1/chat/completions`}</span></div>
+            <button className="btn small" onClick={() => void copy()}><Copy size={13} /> {copied ? "Copied" : "Copy setup"}</button>
+          </div>
+          <pre className="connect-code"><code>{snippet}</code></pre>
+          <div className="connect-foot"><span><i className={`dot ${enabledModels.length ? "" : "a"}`} /> {enabledModels.length ? `${enabledModels.length} enabled model${enabledModels.length === 1 ? "" : "s"}` : "No enabled models yet"}</span><button className="link" onClick={() => { window.history.pushState({}, "", "/models"); window.dispatchEvent(new PopStateEvent("popstate")); }}>Manage models →</button></div>
+        </section>
+      </div>
+      <section className="card protocol-card">
+        <div><b>Anthropic adaptor</b><span>POST /v1/messages · x-api-key or Bearer · streaming and tool calls translated to provider chat format.</span></div>
+        <div><b>OpenAI adaptor</b><span>POST /v1/chat/completions · Bearer authentication · standard Chat Completions request and response shape.</span></div>
+        <div><b>Models discovery</b><span>GET /v1/models · lists enabled logical model IDs available to this API key.</span></div>
+      </section>
+    </>
+  );
+}
+
 function APIKeysPage({
   keys,
   onChanged,

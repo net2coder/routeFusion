@@ -1472,6 +1472,91 @@ footer > span:last-child {
   color: var(--tx);
   font-size: 11px;
 }
+.connect-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.82fr) minmax(0, 1.4fr);
+  gap: 14px;
+  align-items: stretch;
+}
+.connect-setup,
+.connect-output {
+  padding: 18px;
+}
+.connect-setup .field { margin-top: 14px; }
+.connect-setup .field select,
+.connect-setup .field input {
+  width: 100%;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--bd);
+  border-radius: 7px;
+  padding: 9px 10px;
+  color: var(--tx);
+  font-size: 12px;
+}
+.connect-kicker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--tx);
+  font-size: 12px;
+  font-weight: 600;
+}
+.connect-kicker svg { color: var(--g); }
+.connect-note {
+  color: var(--t2);
+  font-size: 11px;
+  line-height: 1.65;
+  margin: 14px 0 0;
+}
+.connect-output-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+.connect-output-head .mono {
+  display: block;
+  color: var(--t2);
+  font-size: 11px;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+.connect-code {
+  min-height: 208px;
+  margin: 18px 0 13px;
+  padding: 16px;
+  border: 1px solid var(--bd);
+  border-radius: 8px;
+  background: #090c0a;
+  color: #b7ecc8;
+  overflow: auto;
+  font: 11px/1.8 var(--mono);
+  white-space: pre;
+}
+.connect-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--t2);
+  font-size: 11px;
+}
+.connect-foot > span { display: flex; align-items: center; gap: 7px; }
+.protocol-card {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 14px;
+  padding: 17px;
+}
+.protocol-card > div { display: grid; gap: 5px; align-content: start; }
+.protocol-card b { font-size: 12px; }
+.protocol-card span { color: var(--t2); font-size: 11px; line-height: 1.6; }
+@media (max-width: 850px) {
+  .connect-grid { grid-template-columns: 1fr; }
+  .protocol-card { grid-template-columns: 1fr; }
+}
 @media (max-width: 460px) {
   .model-select-row {
     flex-direction: column;

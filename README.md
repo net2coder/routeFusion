@@ -1,6 +1,8 @@
 # RouteFusion
 
-RouteFusion is an OpenAI-compatible LLM gateway with a React operations dashboard. The hosted setup uses Vercel for the API and dashboard, and Supabase Postgres for provider/model configuration, hashed client API keys, rate limits, health state, and request history.
+RouteFusion is a hosted model gateway with an OpenAI-compatible Chat Completions adaptor and an Anthropic Messages adaptor, plus a React operations dashboard. The hosted setup uses Vercel for the API and dashboard, and Supabase Postgres for provider/model configuration, hashed client API keys, rate limits, health state, and request history.
+
+The V2 client setup and model-first workflow take inspiration from [FlagshipRouter](https://github.com/theRizwan/FlagshipRouter); RouteFusion keeps its hosted Vercel/Supabase architecture and existing provider management model.
 
 ## Local development
 
@@ -66,6 +68,20 @@ curl https://api.net2coder.in/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"rf-auto","messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+## Coding client adaptors
+
+The same client key and logical model IDs work with both adaptors. OpenAI-compatible SDKs use `https://api.net2coder.in/v1` as the base URL and call `POST /chat/completions`. Anthropic clients call `POST /v1/messages`; they can authenticate with either `x-api-key` or `Authorization: Bearer`. The dashboard's **Connect** page builds client setup snippets for both protocols.
+
+```bash
+curl https://api.net2coder.in/v1/messages \
+  -H 'x-api-key: rf_live_your-generated-key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'content-type: application/json' \
+  -d '{"model":"rf-auto","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+The Anthropic adaptor translates Messages requests, tool calls, and streaming events into the configured providers' OpenAI-compatible Chat Completions format. It supports text, image input, tools, and streaming translation. Provider backends must currently expose OpenAI-compatible `/chat/completions`; this does not make native Anthropic provider APIs interchangeable. Anthropic-only features such as extended thinking and prompt-cache controls are not translated.
 
 ## Data and security
 
