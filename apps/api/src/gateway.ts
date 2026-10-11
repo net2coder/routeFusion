@@ -98,15 +98,44 @@ if (
   throw new Error(
     "Production CORS_ORIGIN entries must be exact HTTPS origins without paths.",
   );
+
+type AuthenticatedClient = { id: string; name: string; ownerId: string };
+const corsAuthenticatedClients = new WeakMap<object, AuthenticatedClient>();
 await app.register(cors, {
-  origin: allowedOrigins,
-  allowedHeaders: [
-    "authorization",
-    "content-type",
-    "x-api-key",
-    "anthropic-version",
-    "anthropic-beta",
-  ],
+  hook: "preHandler",
+  delegator: async (req: import("fastify").FastifyRequest) => {
+    const path = req.url.split("?", 1)[0];
+    const isGenerationRoute =
+      (path === "/v1/chat/completions" || path === "/v1/messages") &&
+      (req.method === "POST" || req.method === "OPTIONS");
+    const shared = {
+      allowedHeaders: [
+        "authorization",
+        "content-type",
+        "x-api-key",
+        "anthropic-version",
+        "anthropic-beta",
+      ],
+      methods: ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"],
+      credentials: false,
+    };
+
+    if (!isGenerationRoute)
+      return { ...shared, origin: allowedOrigins };
+
+    // Browsers omit API credentials from OPTIONS preflight. This only permits
+    // the browser handshake; the following POST still requires a valid key.
+    if (req.method === "OPTIONS")
+      return { ...shared, origin: "*", methods: ["POST", "OPTIONS"] };
+
+    if (!req.headers.origin) return { ...shared, origin: false };
+    const authenticated = await clientAuth(
+      req.headers.authorization,
+      headerValue(req.headers["x-api-key"]),
+    );
+    if (authenticated) corsAuthenticatedClients.set(req, authenticated);
+    return { ...shared, origin: authenticated ? "*" : false };
+  },
 });
 const requestsPerMinute = Math.max(
   1,
@@ -1147,7 +1176,10 @@ async function admin(auth?: string) {
 function hashClientKey(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
-async function clientAuth(auth?: string, apiKey?: string) {
+async function clientAuth(
+  auth?: string,
+  apiKey?: string,
+): Promise<AuthenticatedClient | null> {
   const token = auth?.replace(/^Bearer\s+/i, "") || apiKey?.trim();
   if (!token) return null;
   if (supabase) {
@@ -2082,10 +2114,12 @@ async function handleChatRequest(
   body: z.infer<typeof chatSchema>,
   format: "openai" | "anthropic",
 ) {
-  const authenticated = await clientAuth(
-    req.headers.authorization,
-    headerValue(req.headers["x-api-key"]),
-  );
+  const authenticated =
+    corsAuthenticatedClients.get(req) ??
+    (await clientAuth(
+      req.headers.authorization,
+      headerValue(req.headers["x-api-key"]),
+    ));
   if (!authenticated)
     return reply
       .code(401)
