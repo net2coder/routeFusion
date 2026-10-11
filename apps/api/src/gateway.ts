@@ -780,13 +780,16 @@ const anthropicMessageSchema = z
       .array(
         z
           .object({
-            role: z.enum(["user", "assistant"]),
+            // Some Anthropic-compatible clients include a system message in
+            // the messages array even though the canonical API uses `system`.
+            role: z.enum(["system", "developer", "user", "assistant"]),
             content: z.union([z.string(), z.array(z.any())]),
           })
           .passthrough(),
       )
       .min(1),
-    max_tokens: z.number().int().positive(),
+    // Be tolerant of gateways that serialize numeric settings as strings.
+    max_tokens: z.coerce.number().int().positive(),
     stream: z.boolean().optional().default(false),
     system: z.any().optional(),
     temperature: z.number().optional(),
@@ -853,6 +856,13 @@ function anthropicToOpenAI(body: AnthropicRequest) {
     messages.push({ role: "system", content: system });
 
   for (const message of body.messages) {
+    if (message.role === "system" || message.role === "developer") {
+      messages.push({
+        role: "system",
+        content: anthropicContentToOpenAI(message.content),
+      });
+      continue;
+    }
     if (typeof message.content === "string") {
       messages.push({ role: message.role, content: message.content });
       continue;
@@ -2445,7 +2455,9 @@ app.post("/v1/messages", async (req, reply) => {
       "anthropic",
       400,
       "invalid_request_error",
-      "Invalid Anthropic Messages request",
+      `Invalid Anthropic Messages request: ${parsed.error.issues
+        .map((issue) => `${issue.path.join(".") || "body"}: ${issue.message}`)
+        .join("; ")}`,
     );
   const converted = chatSchema.safeParse(anthropicToOpenAI(parsed.data));
   if (!converted.success)
