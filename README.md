@@ -81,7 +81,20 @@ curl https://api.net2coder.in/v1/messages \
   -d '{"model":"rf-auto","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-The Anthropic adaptor translates Messages requests, tool calls, and streaming events into the configured providers' OpenAI-compatible Chat Completions format. It supports text, image input, tools, and streaming translation. Provider backends must currently expose OpenAI-compatible `/chat/completions`; this does not make native Anthropic provider APIs interchangeable. Anthropic-only features such as extended thinking and prompt-cache controls are not translated.
+### Compatibility boundary
+
+RouteFusion currently exposes these inference methods:
+
+| Client protocol | Supported method | Behavior |
+| --- | --- | --- |
+| OpenAI | `POST /v1/chat/completions` | Validates the chat envelope and forwards the remaining Chat Completions fields to the selected OpenAI-compatible provider. Non-streaming JSON is returned with the requested logical model ID; streaming SSE is passed through. Assistant tool-call messages may omit `content`. |
+| Anthropic | `POST /v1/messages` | Translates text and base64/URL image input, client-side function tools and tool results, stop sequences, JSON Schema output, and streaming text/tool events into OpenAI-compatible Chat Completions requests and Anthropic-shaped responses. |
+| OpenAI | `GET /v1/models`, `GET /v1/models/{model_id}` | Lists enabled RouteFusion logical model IDs and retrieves one enabled model using OpenAI response shapes. These endpoints require a valid client key. |
+| Anthropic | `GET /v1/models`, `GET /v1/models/{model_id}` | When `anthropic-version` is present, uses Anthropic model response shapes. These endpoints require a valid client key. |
+
+The Anthropic adaptor is a Messages protocol bridge, not full Anthropic API emulation. It does not implement token counting, batches, files, embeddings, or other Anthropic endpoints. Client-side function tools work; server-side tools (web search, code execution, MCP, and similar) and document/PDF blocks do not. Extended thinking blocks and prompt-cache/context-management controls are not preserved. Adaptive `thinking.effort` is translated to OpenAI `reasoning_effort` when it is `low`, `medium`, or `high`; whether the selected provider honors that field depends on the provider/model. Unsupported content blocks and server-side tool declarations return field-specific 400 errors instead of silently disappearing. `cache_control` annotations and `top_k` are accepted but not forwarded.
+
+OpenAI Chat Completions fields are forwarded to the provider, but their actual availability depends on that provider and model. RouteFusion does not add OpenAI Responses API, Assistants API, audio, image generation, embeddings, or moderation routes. For both adaptors, the configured provider must expose an OpenAI-compatible `/chat/completions` endpoint; a native Anthropic provider endpoint is not interchangeable.
 
 ## Data and security
 

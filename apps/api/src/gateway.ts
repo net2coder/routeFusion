@@ -765,7 +765,15 @@ const chatSchema = z
   .object({
     model: z.string().min(1),
     messages: z
-      .array(z.object({ role: z.string(), content: z.any() }).passthrough())
+      .array(
+        z
+          .object({
+            role: z.string(),
+            // OpenAI permits assistant tool-call messages without content.
+            content: z.any().optional().nullable(),
+          })
+          .passthrough(),
+      )
       .min(1),
     stream: z.boolean().optional().default(false),
     tools: z.array(z.any()).optional(),
@@ -797,8 +805,142 @@ const anthropicMessageSchema = z
     stop_sequences: z.array(z.string()).optional(),
     tools: z.array(z.any()).optional(),
     tool_choice: z.any().optional(),
+    output_config: z.any().optional(),
+    thinking: z.any().optional(),
+    metadata: z.any().optional(),
   })
-  .passthrough();
+  .passthrough()
+  .superRefine((body, ctx) => {
+    const inspect = (
+      content: unknown,
+      path: (string | number)[],
+      role?: string,
+    ) => {
+      if (!Array.isArray(content)) return;
+      content.forEach((block, index) => {
+        if (!block || typeof block !== "object") return;
+        const item = block as Record<string, any>;
+        const blockPath = [...path, index];
+        if (!["text", "image", "tool_use", "tool_result"].includes(item.type))
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: blockPath,
+            message: `Content block type '${String(item.type)}' is not supported by the OpenAI-compatible provider adaptor`,
+          });
+        if (
+          (item.type === "tool_use" && role !== "assistant") ||
+          (item.type === "tool_result" && role !== "user")
+        )
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: blockPath,
+            message: `${item.type} blocks are not valid in a ${role ?? "system"} message`,
+          });
+        if (
+          item.type === "tool_use" &&
+          (!item.id ||
+            !item.name ||
+            !item.input ||
+            typeof item.input !== "object" ||
+            Array.isArray(item.input))
+        )
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: blockPath,
+            message: "tool_use requires id, name, and object input fields",
+          });
+        if (item.type === "tool_result" && !item.tool_use_id)
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [...blockPath, "tool_use_id"],
+            message: "tool_result requires tool_use_id",
+          });
+        if (item.type === "text" && typeof item.text !== "string")
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [...blockPath, "text"],
+            message: "text blocks require a string text field",
+          });
+        if (item.type === "tool_result" && item.content !== undefined)
+          inspect(item.content, [...blockPath, "content"], "tool");
+        if (
+          item.type === "image" &&
+          !(
+            (item.source?.type === "base64" &&
+              typeof item.source.data === "string" &&
+              typeof item.source.media_type === "string") ||
+            (item.source?.type === "url" &&
+              typeof item.source.url === "string")
+          )
+        )
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [...blockPath, "source"],
+            message: "Only base64 and URL image sources can be translated",
+          });
+      });
+    };
+    inspect(body.system, ["system"], "system");
+    body.messages.forEach((message, index) =>
+      inspect(
+        message.content,
+        ["messages", index, "content"],
+        message.role,
+      ),
+    );
+    for (const field of ["container", "mcp_servers"])
+      if (body[field] !== undefined)
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: `${field} requires Anthropic server-side tool support, which this gateway does not provide`,
+        });
+    body.tools?.forEach((tool, index) => {
+      if (
+        !tool ||
+        typeof tool !== "object" ||
+        typeof tool.name !== "string" ||
+        !tool.name ||
+        (tool.type !== undefined && tool.type !== "custom")
+      )
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["tools", index],
+          message: "Only client-side function tools can be translated",
+        });
+    });
+    if (
+      body.tool_choice !== undefined &&
+      (!body.tool_choice ||
+        !["auto", "none", "any", "tool"].includes(body.tool_choice.type) ||
+        (body.tool_choice.type === "tool" &&
+          typeof body.tool_choice.name !== "string"))
+    )
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["tool_choice"],
+        message: "tool_choice must be auto, none, any, or a named tool",
+      });
+    const outputFormat = body.output_config?.format;
+    if (
+      outputFormat !== undefined &&
+      outputFormat?.type !== "json_schema"
+    )
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["output_config", "format"],
+        message: "Only JSON Schema output format can be translated",
+      });
+    if (
+      outputFormat?.type === "json_schema" &&
+      (!outputFormat.schema || typeof outputFormat.schema !== "object")
+    )
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["output_config", "format", "schema"],
+        message: "JSON Schema output format requires a schema object",
+      });
+  });
 
 type AnthropicRequest = z.infer<typeof anthropicMessageSchema>;
 type OpenAICompletion = {
@@ -807,7 +949,8 @@ type OpenAICompletion = {
   choices?: Array<{
     finish_reason?: string | null;
     message?: {
-      content?: string | null;
+      content?: unknown;
+      refusal?: string | null;
       tool_calls?: Array<{
         id?: string;
         function?: { name?: string; arguments?: string };
@@ -818,6 +961,7 @@ type OpenAICompletion = {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
   };
 };
 
@@ -828,6 +972,8 @@ function anthropicContentToOpenAI(content: unknown): unknown {
     if (!block || typeof block !== "object") return [];
     const item = block as Record<string, any>;
     if (item.type === "text") return [{ type: "text", text: item.text ?? "" }];
+    if (item.type === "refusal")
+      return [{ type: "text", text: item.refusal ?? "" }];
     if (item.type === "image") {
       const source = item.source;
       if (source?.type === "url")
@@ -899,13 +1045,16 @@ function anthropicToOpenAI(body: AnthropicRequest) {
     if (message.role === "user") {
       for (const result of blocks.filter((block) => block?.type === "tool_result")) {
         const resultContent = anthropicContentToOpenAI(result.content);
+        const errorPrefix = result.is_error ? "Tool error: " : "";
         messages.push({
           role: "tool",
           tool_call_id: result.tool_use_id,
           content:
             typeof resultContent === "string"
-              ? resultContent
-              : JSON.stringify(resultContent),
+              ? `${errorPrefix}${resultContent}`
+              : Array.isArray(resultContent) && errorPrefix
+                ? [{ type: "text", text: errorPrefix }, ...resultContent]
+                : resultContent,
         });
       }
     }
@@ -917,6 +1066,7 @@ function anthropicToOpenAI(body: AnthropicRequest) {
       name: tool.name,
       description: tool.description,
       parameters: tool.input_schema ?? { type: "object", properties: {} },
+      ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
     },
   }));
   let toolChoice: unknown;
@@ -929,6 +1079,15 @@ function anthropicToOpenAI(body: AnthropicRequest) {
       function: { name: body.tool_choice.name },
     };
 
+  const parallelToolCalls =
+    body.tool_choice?.disable_parallel_tool_use === true ? false : undefined;
+  const format = body.output_config?.format;
+  const effort =
+    body.thinking?.type === "adaptive" &&
+    ["low", "medium", "high"].includes(body.thinking.effort)
+      ? body.thinking.effort
+      : undefined;
+
   return {
     model: body.model,
     messages,
@@ -936,17 +1095,54 @@ function anthropicToOpenAI(body: AnthropicRequest) {
     max_tokens: body.max_tokens,
     temperature: body.temperature,
     top_p: body.top_p,
+    ...(effort ? { reasoning_effort: effort } : {}),
+    ...(typeof body.metadata?.user_id === "string"
+      ? { user: body.metadata.user_id }
+      : {}),
     stop: body.stop_sequences,
     ...(tools?.length ? { tools } : {}),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
+    ...(format?.type === "json_schema"
+      ? {
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: format.name ?? "response",
+              schema: format.schema,
+              ...(format.strict !== undefined ? { strict: format.strict } : {}),
+            },
+          },
+        }
+      : {}),
+    ...(parallelToolCalls !== undefined
+      ? { parallel_tool_calls: parallelToolCalls }
+      : {}),
   };
 }
 
-function toAnthropicMessage(response: OpenAICompletion, requestedModel: string) {
+function toAnthropicMessage(
+  response: OpenAICompletion,
+  requestedModel: string,
+  stopSequences: string[] = [],
+) {
   const choice = response.choices?.[0];
   const content: Array<Record<string, unknown>> = [];
-  if (choice?.message?.content)
-    content.push({ type: "text", text: choice.message.content });
+  const responseContent = choice?.message?.content;
+  if (typeof responseContent === "string" && responseContent)
+    content.push({ type: "text", text: responseContent });
+  else if (Array.isArray(responseContent)) {
+    for (const block of responseContent) {
+      if (block && typeof block === "object") {
+        const item = block as Record<string, unknown>;
+        if (item.type === "text" && typeof item.text === "string")
+          content.push({ type: "text", text: item.text });
+        else if (item.type === "refusal" && typeof item.refusal === "string")
+          content.push({ type: "text", text: item.refusal });
+      }
+    }
+  }
+  if (choice?.message?.refusal)
+    content.push({ type: "text", text: choice.message.refusal });
   for (const call of choice?.message?.tool_calls ?? []) {
     let input: unknown = {};
     try {
@@ -962,12 +1158,15 @@ function toAnthropicMessage(response: OpenAICompletion, requestedModel: string) 
     });
   }
   const finish = choice?.finish_reason;
-  const stopReason =
-    finish === "length"
-      ? "max_tokens"
-      : finish === "tool_calls" || finish === "function_call"
-        ? "tool_use"
-        : "end_turn";
+  const text = content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+  const matchedStop =
+    finish === "stop"
+      ? stopSequences.find((sequence) => sequence && text.endsWith(sequence))
+      : undefined;
+  const stopReason = matchedStop ? "stop_sequence" : anthropicStopReason(finish);
   return {
     id: response.id?.startsWith("msg_")
       ? response.id
@@ -977,19 +1176,36 @@ function toAnthropicMessage(response: OpenAICompletion, requestedModel: string) 
     content,
     model: requestedModel,
     stop_reason: stopReason,
-    stop_sequence: null,
+    stop_sequence: matchedStop ?? null,
     usage: {
       input_tokens: response.usage?.prompt_tokens ?? 0,
       output_tokens: response.usage?.completion_tokens ?? 0,
+      ...(response.usage?.prompt_tokens_details?.cached_tokens !== undefined
+        ? {
+            cache_read_input_tokens:
+              response.usage.prompt_tokens_details.cached_tokens,
+          }
+        : {}),
     },
   };
+}
+
+function anthropicStopReason(finish: string | null | undefined) {
+  if (finish === "length") return "max_tokens";
+  if (finish === "tool_calls" || finish === "function_call") return "tool_use";
+  if (finish === "content_filter") return "refusal";
+  return "end_turn";
 }
 
 function anthropicSse(event: string, data: unknown) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-function toAnthropicStream(source: Readable, requestedModel: string) {
+function toAnthropicStream(
+  source: Readable,
+  requestedModel: string,
+  stopSequences: string[] = [],
+) {
   const generate = async function* () {
     const messageId = `msg_${randomUUID().replaceAll("-", "")}`;
     let started = false;
@@ -997,9 +1213,12 @@ function toAnthropicStream(source: Readable, requestedModel: string) {
     let textBlockIndex: number | null = null;
     let stopReason = "end_turn";
     let outputTokens = 0;
+    let outputText = "";
+    let stopSequence: string | null = null;
+    let sawError = false;
     const toolBlocks = new Map<
       number,
-      { blockIndex: number; id: string; name: string }
+      { blockIndex: number; id: string; name: string; started: boolean }
     >();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -1030,11 +1249,25 @@ function toAnthropicStream(source: Readable, requestedModel: string) {
       } catch {
         return "";
       }
+      if (chunk.error) {
+        sawError = true;
+        return anthropicSse("error", {
+          type: "error",
+          error: {
+            type: "api_error",
+            message:
+              typeof chunk.error.message === "string"
+                ? chunk.error.message
+                : "The upstream provider reported a streaming error",
+          },
+        });
+      }
       let output = startMessage();
       outputTokens = chunk.usage?.completion_tokens ?? outputTokens;
       const choice = chunk.choices?.[0];
       const delta = choice?.delta;
       if (typeof delta?.content === "string" && delta.content) {
+        outputText += delta.content;
         if (textBlockIndex === null) {
           textBlockIndex = nextBlockIndex++;
           output += anthropicSse("content_block_start", {
@@ -1063,24 +1296,28 @@ function toAnthropicStream(source: Readable, requestedModel: string) {
           block = {
             blockIndex: nextBlockIndex++,
             id: call.id ?? `toolu_${randomUUID().replaceAll("-", "")}`,
-            name: call.function?.name ?? "tool",
+            name: "",
+            started: false,
           };
           toolBlocks.set(toolIndex, block);
+        } else {
+          if (call.id) block.id = call.id;
+        }
+        if (call.function?.name) block.name += call.function.name;
+        const partial = call.function?.arguments;
+        if (typeof partial === "string" && !block.started) {
+          block.started = true;
           output += anthropicSse("content_block_start", {
             type: "content_block_start",
             index: block.blockIndex,
             content_block: {
               type: "tool_use",
               id: block.id,
-              name: block.name,
+              name: block.name || "tool",
               input: {},
             },
           });
-        } else {
-          if (call.id) block.id = call.id;
-          if (call.function?.name) block.name = call.function.name;
         }
-        const partial = call.function?.arguments;
         if (typeof partial === "string" && partial)
           output += anthropicSse("content_block_delta", {
             type: "content_block_delta",
@@ -1089,13 +1326,15 @@ function toAnthropicStream(source: Readable, requestedModel: string) {
           });
       }
       if (choice?.finish_reason) {
-        stopReason =
-          choice.finish_reason === "length"
-            ? "max_tokens"
-            : choice.finish_reason === "tool_calls" ||
-                choice.finish_reason === "function_call"
-              ? "tool_use"
-              : "end_turn";
+        stopSequence =
+          choice.finish_reason === "stop"
+            ? stopSequences.find(
+                (sequence) => sequence && outputText.endsWith(sequence),
+              ) ?? null
+            : null;
+        stopReason = stopSequence
+          ? "stop_sequence"
+          : anthropicStopReason(choice.finish_reason);
       }
       return output;
     };
@@ -1124,6 +1363,7 @@ function toAnthropicStream(source: Readable, requestedModel: string) {
         if (line.startsWith("data:")) {
           const output = processData(line.slice(5).trimStart());
           if (output) yield output;
+          if (sawError) return;
         }
         newline = buffer.indexOf("\n");
       }
@@ -1132,20 +1372,33 @@ function toAnthropicStream(source: Readable, requestedModel: string) {
     if (buffer.startsWith("data:")) {
       const output = processData(buffer.slice(5).trim());
       if (output) yield output;
+      if (sawError) return;
     }
     if (textBlockIndex !== null)
       yield anthropicSse("content_block_stop", {
         type: "content_block_stop",
         index: textBlockIndex,
       });
-    for (const block of toolBlocks.values())
+    for (const block of toolBlocks.values()) {
+      if (!block.started)
+        yield anthropicSse("content_block_start", {
+          type: "content_block_start",
+          index: block.blockIndex,
+          content_block: {
+            type: "tool_use",
+            id: block.id,
+            name: block.name || "tool",
+            input: {},
+          },
+        });
       yield anthropicSse("content_block_stop", {
         type: "content_block_stop",
         index: block.blockIndex,
       });
+    }
     yield anthropicSse("message_delta", {
       type: "message_delta",
-      delta: { stop_reason: stopReason, stop_sequence: null },
+      delta: { stop_reason: stopReason, stop_sequence: stopSequence },
       usage: { output_tokens: outputTokens },
     });
     yield anthropicSse("message_stop", { type: "message_stop" });
@@ -1273,11 +1526,17 @@ function setKey(p: Provider, key: string) {
   p.keyHint = `••••••••${key.slice(-4)}`;
 }
 function routeCandidates(body: z.infer<typeof chatSchema>) {
-  const tools = !!body.tools?.length;
+  const tools =
+    !!body.tools?.length ||
+    body.messages.some(
+      (message) =>
+        message.role === "tool" ||
+        (Array.isArray(message.tool_calls) && message.tool_calls.length > 0),
+    );
   const vision = body.messages.some(
     (m) =>
       typeof m.content !== "string" &&
-      JSON.stringify(m.content).toLowerCase().includes("image"),
+      JSON.stringify(m.content ?? "").toLowerCase().includes("image"),
   );
   const candidates = models
     .filter(
@@ -1506,29 +1765,48 @@ app.get("/health/providers", async () =>
     latency: p.latency,
   })),
 );
-app.get("/v1/models", async (req, reply) => {
+async function authenticateModelRequest(
+  req: import("fastify").FastifyRequest,
+  reply: import("fastify").FastifyReply,
+): Promise<AuthenticatedClient | null> {
   const authenticated = await clientAuth(
     req.headers.authorization,
     headerValue(req.headers["x-api-key"]),
   );
-  if (!authenticated)
-    return reply
-      .code(401)
-      .send({
-        error: { message: "Invalid API key", type: "authentication_error" },
-      });
+  if (!authenticated) {
+    reply.code(401).send(
+      usesAnthropicProtocol(req)
+        ? { type: "error", error: { message: "Invalid API key", type: "authentication_error" } }
+        : { error: { message: "Invalid API key", type: "authentication_error" } },
+    );
+    return null;
+  }
   const bearer =
     req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
     headerValue(req.headers["x-api-key"]) ||
     "";
-  if (!(await consumeSharedRateLimit(bearer)))
-    return reply
-      .code(429)
-      .send({
-        error: { message: "Rate limit exceeded", type: "rate_limit_error" },
-      });
+  if (!(await consumeSharedRateLimit(bearer))) {
+    reply.code(429).send(
+      usesAnthropicProtocol(req)
+        ? { type: "error", error: { message: "Rate limit exceeded", type: "rate_limit_error" } }
+        : { error: { message: "Rate limit exceeded", type: "rate_limit_error" } },
+    );
+    return null;
+  }
   if (authenticated.id !== "environment")
     await touchClientKey(authenticated.id);
+  return authenticated;
+}
+function visibleModelIds() {
+  return [...new Set(models.filter((m) => m.enabled).map((m) => m.logicalModelId))]
+    .sort((a, b) => a.localeCompare(b));
+}
+function usesAnthropicProtocol(req: import("fastify").FastifyRequest) {
+  return typeof req.headers["anthropic-version"] === "string";
+}
+app.get("/v1/models", async (req, reply) => {
+  const authenticated = await authenticateModelRequest(req, reply);
+  if (!authenticated) return;
   await recordSafely({
     id: `req_${randomUUID().slice(0, 8)}`,
     time: new Date().toISOString(),
@@ -1542,17 +1820,43 @@ app.get("/v1/models", async (req, reply) => {
     apiKeyId: authenticated.id === "environment" ? null : authenticated.id,
     apiKeyName: authenticated.name,
   });
+  if (usesAnthropicProtocol(req)) {
+    const data = visibleModelIds().map((id) => ({
+      type: "model",
+      id,
+      display_name: models.find((model) => model.logicalModelId === id)?.displayName ?? id,
+      created_at: new Date(0).toISOString(),
+    }));
+    return { data, has_more: false, first_id: data[0]?.id ?? null, last_id: data.at(-1)?.id ?? null };
+  }
   return {
     object: "list",
-    data: [
-      ...new Set(models.filter((m) => m.enabled).map((m) => m.logicalModelId)),
-    ].map((id) => ({
+    data: visibleModelIds().map((id) => ({
       id,
       object: "model",
       created: 0,
       owned_by: "routefusion",
     })),
   };
+});
+app.get("/v1/models/:model_id", async (req, reply) => {
+  const authenticated = await authenticateModelRequest(req, reply);
+  if (!authenticated) return;
+  const id = (req.params as { model_id: string }).model_id;
+  if (!visibleModelIds().includes(id))
+    return reply.code(404).send(
+      usesAnthropicProtocol(req)
+        ? { type: "error", error: { type: "not_found_error", message: "Model not found" } }
+        : { error: { type: "not_found", message: "Model not found", request_id: req.id } },
+    );
+  return usesAnthropicProtocol(req)
+    ? {
+        type: "model",
+        id,
+        display_name: models.find((model) => model.logicalModelId === id)?.displayName ?? id,
+        created_at: new Date(0).toISOString(),
+      }
+    : { id, object: "model", created: 0, owned_by: "routefusion" };
 });
 app.get("/admin/overview", async (req, reply) => {
   if (!(await requireAdmin(req, reply))) return;
@@ -2257,7 +2561,16 @@ async function handleChatRequest(
       }
       await persistProviderHealthSafely(provider);
       if (upstream.status !== 429 && upstream.status < 500) {
-        await upstream.body?.cancel();
+        let providerMessage = "Provider rejected the request";
+        try {
+          const payload = JSON.parse(await readLimitedText(upstream, 65536));
+          const candidate =
+            payload?.error?.message ?? payload?.message ?? payload?.detail;
+          if (typeof candidate === "string" && candidate.trim())
+            providerMessage = candidate.trim().slice(0, 1000);
+        } catch {
+          await upstream.body?.cancel().catch(() => undefined);
+        }
         await recordSafely({
           ...baseLog,
           id,
@@ -2275,7 +2588,7 @@ async function handleChatRequest(
           format,
           upstream.status,
           format === "anthropic" ? "api_error" : "provider_error",
-          "Provider rejected the request",
+          providerMessage,
           id,
         );
       }
@@ -2304,7 +2617,11 @@ async function handleChatRequest(
       );
       const stream =
         format === "anthropic"
-          ? toAnthropicStream(upstreamStream, body.model)
+          ? toAnthropicStream(
+              upstreamStream,
+              body.model,
+              (body.stop as string[] | undefined) ?? [],
+            )
           : upstreamStream;
       let completed = false;
       const settle = (status: number) => {
@@ -2370,7 +2687,11 @@ async function handleChatRequest(
         attempts: [...attempts],
       });
       if (format === "anthropic")
-        return toAnthropicMessage(response, body.model);
+        return toAnthropicMessage(
+          response,
+          body.model,
+          (body.stop as string[] | undefined) ?? [],
+        );
       response.model = body.model;
       return response;
     } catch (error) {
@@ -2442,7 +2763,9 @@ app.post("/v1/chat/completions", async (req, reply) => {
       "openai",
       400,
       "invalid_request_error",
-      "Invalid request",
+      `Invalid request: ${parsed.error.issues
+        .map((issue) => `${issue.path.join(".") || "body"}: ${issue.message}`)
+        .join("; ")}`,
     );
   return handleChatRequest(req, reply, parsed.data, "openai");
 });
@@ -2466,7 +2789,9 @@ app.post("/v1/messages", async (req, reply) => {
       "anthropic",
       400,
       "invalid_request_error",
-      "Anthropic request could not be translated to the provider format",
+      `Anthropic request could not be translated to the provider format: ${converted.error.issues
+        .map((issue) => `${issue.path.join(".") || "body"}: ${issue.message}`)
+        .join("; ")}`,
     );
   return handleChatRequest(req, reply, converted.data, "anthropic");
 });
