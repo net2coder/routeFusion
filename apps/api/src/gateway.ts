@@ -1746,6 +1746,27 @@ app.get("/", async () => ({
   health: "/health",
   ready: "/health/ready",
 }));
+app.get("/v1", async () => ({
+  service: "routefusion-api",
+  version: "v1",
+  status: "ok",
+  authentication: "Bearer token or x-api-key",
+  endpoints: {
+    openai: {
+      base_url: "/v1",
+      chat_completions: "POST /v1/chat/completions",
+      models: "GET /v1/models",
+      model: "GET /v1/models/{model_id}",
+    },
+    anthropic: {
+      messages: "POST /v1/messages",
+      models: "GET /v1/models (send anthropic-version header)",
+      model: "GET /v1/models/{model_id} (send anthropic-version header)",
+    },
+  },
+  health: "/health",
+  readiness: "/health/ready",
+}));
 app.get("/health", async () => ({ status: "ok", service: "routefusion-api" }));
 app.get("/health/ready", async (_req, reply) => {
   if (!supabase) return { status: "ready", storage: "local" };
